@@ -2,23 +2,23 @@
 # SPDX-License-Identifier: GPL-3.0
 """Verify the SKSE version declaration exported by a built SKSE plugin DLL.
 
-Why this exists: a plugin built against an Address Library that predates the
-format-5 runtime (Skyrim AE 1.7.104, Address Library v13) declares
-``versionIndependenceEx`` without the V5 bit, and SKSE then refuses to load it.
-"CI is green" does not mean "the plugin loads" - so this asserts the exact
-declaration instead of trusting the build.
+What this checks, and why the claim is narrow: it asserts only that the exported
+``SKSEPlugin_Version`` struct is well formed (dataVersion == 1) and declares Address
+Library independence. It does NOT assert the AddressLibraryV5 bit - see the note in
+``report()``: V5 records which Address Library id space the plugin's ids came from,
+and plugins without it load fine on 1.7.104.
+
+"CI is green" is not "the plugin loads", and "the plugin loads" is not "the plugin
+works" - skse64.log is the evidence for the second, and the game is the evidence for
+the third.
 
 The exported symbol ``SKSEPlugin_Version`` is a *data* export pointing at the
 plugin's version struct; PE does not distinguish data from code exports, so the
 function RVA in the export table is the struct address.
 
-Checks (exit 1 on any failure):
-  * SKSEPlugin_Version export exists
-  * dataVersion == 1
-  * versionIndependence has the AddressLibraryPostAE bit (1 << 0)
-  * versionIndependenceEx has the AddressLibraryV5 bit (1 << 1)   <-- the 1.7.104 gate
-
-Usage: check_skse_version.py path/to/Plugin.dll [--expect-exact NAME AUTHOR]
+Usage:
+  check_skse_version.py path/to/Plugin.dll
+  check_skse_version.py --scan /path/to/SKSE/Plugins
 """
 
 from __future__ import annotations
@@ -89,9 +89,11 @@ class Pe:
     def export(self, name: str) -> int:
         """Return the RVA of the named export, or raise KeyError."""
         off = self.rva_to_off(self.export_rva)
-        (_, _, _, _, _, _, n_func, n_names, addr_func, addr_names, addr_ords) = struct.unpack_from(
-            "<IIIIIIIIII", self.data, off
-        )
+        # IMAGE_EXPORT_DIRECTORY (40 bytes): MajorVersion/MinorVersion are WORDs.
+        (
+            _chars, _tds, _major, _minor, _name_rva, _base,
+            n_func, n_names, addr_func, addr_names, addr_ords,
+        ) = struct.unpack_from("<IIHHIIIIIII", self.data, off)
         names_off = self.rva_to_off(addr_names)
         funcs_off = self.rva_to_off(addr_func)
         ords_off = self.rva_to_off(addr_ords)
@@ -104,23 +106,18 @@ class Pe:
         raise KeyError(name)
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("dll")
-    args = ap.parse_args()
-
-    data = open(args.dll, "rb").read()
+def report(dll: str, verbose: bool = True) -> int:
+    data = open(dll, "rb").read()
     pe = Pe(data)
-    print(f"  file        : {args.dll} ({len(data)} bytes, {pe.magic})")
     try:
         rva = pe.export("SKSEPlugin_Version")
     except KeyError:
-        print("  FAIL: no SKSEPlugin_Version export - SKSE cannot load this plugin")
+        print(f"  {dll}: no SKSEPlugin_Version export")
         return 1
     off = pe.rva_to_off(rva)
     v = data[off : off + STRUCT_SIZE]
     if len(v) < STRUCT_SIZE:
-        print("  FAIL: version struct is truncated")
+        print(f"  {dll}: version struct truncated")
         return 1
 
     def u32(o: int) -> int:
@@ -128,32 +125,72 @@ def main() -> int:
 
     dv, pv = u32(OFF_DATA_VERSION), u32(OFF_PLUGIN_VERSION)
     ex, ind, xse = u32(OFF_INDEPENDENCE_EX), u32(OFF_INDEPENDENCE), u32(OFF_XSE_MINIMUM)
-    print(f"  SKSEPlugin_Version @ rva 0x{rva:x} (file 0x{off:x})")
-    print(f"  dataVersion            : {dv}")
-    print(f"  pluginVersion          : {pv}")
-    print(f"  pluginName             : {_cstr(v[OFF_PLUGIN_NAME : OFF_PLUGIN_NAME + 256])!r}")
-    print(f"  author                 : {_cstr(v[OFF_AUTHOR : OFF_AUTHOR + 256])!r}")
-    print(f"  versionIndependence    : 0x{ind:x}  (AddressLibrary bit: {bool(ind & K_VERSION_INDEPENDENT_ADDRESS_LIBRARY_POST_AE)})")
-    print(f"  versionIndependenceEx  : 0x{ex:x}  (V5 bit: {bool(ex & K_VERSION_INDEPENDENT_EX_ADDRESS_LIBRARY_V5)}, "
-          f"NoStructUse bit: {bool(ex & K_VERSION_INDEPENDENT_EX_NO_STRUCT_USE)})")
-    print(f"  xseMinimum             : {xse}")
+    name = _cstr(v[OFF_PLUGIN_NAME : OFF_PLUGIN_NAME + 256])
+    author = _cstr(v[OFF_AUTHOR : OFF_AUTHOR + 256])
+
+    if not verbose:
+        print(
+            f"  {name or '(unnamed)':28s} dataVersion={dv} ind=0x{ind:x} ex=0x{ex:x} "
+            f"V5={'yes' if ex & K_VERSION_INDEPENDENT_EX_ADDRESS_LIBRARY_V5 else 'NO ':3s} "
+            f"{author[:22]}"
+        )
+    else:
+        print(f"  file        : {dll} ({len(data)} bytes, {pe.magic})")
+        print(f"  SKSEPlugin_Version @ rva 0x{rva:x} (file 0x{off:x})")
+        print(f"  dataVersion            : {dv}")
+        print(f"  pluginVersion          : {pv}")
+        print(f"  pluginName             : {name!r}")
+        print(f"  author                 : {author!r}")
+        print(f"  versionIndependence    : 0x{ind:x}  (AddressLibrary bit: "
+              f"{bool(ind & K_VERSION_INDEPENDENT_ADDRESS_LIBRARY_POST_AE)})")
+        print(f"  versionIndependenceEx  : 0x{ex:x}  (V5 bit: "
+              f"{bool(ex & K_VERSION_INDEPENDENT_EX_ADDRESS_LIBRARY_V5)}, NoStructUse bit: "
+              f"{bool(ex & K_VERSION_INDEPENDENT_EX_NO_STRUCT_USE)})")
+        print(f"  xseMinimum             : {xse}")
 
     failures = []
     if dv != 1:
         failures.append(f"dataVersion is {dv}, expected 1")
     if not ind & K_VERSION_INDEPENDENT_ADDRESS_LIBRARY_POST_AE:
         failures.append("versionIndependence lacks the AddressLibrary(PostAE) bit")
+    # NOTE: the V5 bit is deliberately NOT asserted. It declares which Address Library
+    # *id space* the plugin's ids were compiled against; it is not a load gate. Measured
+    # on a working 1.7.104 install: of 40 installed plugins, many that load fine declare
+    # versionIndependenceEx=0x1 (no V5) - CrashLogger, BetterJumpingSE, ConsoleUtilSSE -
+    # while others declare 0x3. Both kinds load. See skse64.log: SKSE 'checks' then
+    # 'loads' them with no incompatible/disabled line.
     if not ex & K_VERSION_INDEPENDENT_EX_ADDRESS_LIBRARY_V5:
-        failures.append(
-            "versionIndependenceEx lacks the AddressLibraryV5 bit -> SKSE will refuse this "
-            "plugin on 1.7.104 (Address Library v13 / format 5)"
-        )
+        print("  NOTE: no V5 bit (declares the pre-format-5 id space) - not a load failure")
     if failures:
         for f in failures:
             print(f"  FAIL: {f}")
         return 1
-    print("  OK: declaration is V5 / 1.7.104 compatible")
+    if verbose:
+        print("  OK: declaration is loadable (dataVersion 1 + AddressLibrary bit)")
     return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("dll", nargs="?")
+    ap.add_argument("--scan", metavar="DIR", help="report every SKSE plugin DLL in DIR")
+    args = ap.parse_args()
+
+    if args.scan:
+        import glob
+        import os
+
+        dlls = sorted(glob.glob(os.path.join(args.scan, "*.dll")))
+        print(f"  scanning {len(dlls)} DLL(s) in {args.scan}")
+        for d in dlls:
+            try:
+                report(d, verbose=False)
+            except Exception as exc:  # noqa: BLE001 - a scan should not abort
+                print(f"  {os.path.basename(d):28s} unreadable: {exc}")
+        return 0
+    if not args.dll:
+        ap.error("a DLL path or --scan DIR is required")
+    return report(args.dll)
 
 
 if __name__ == "__main__":
