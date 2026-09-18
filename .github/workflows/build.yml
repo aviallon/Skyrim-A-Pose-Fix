@@ -14,12 +14,12 @@ name: build
 # manager installs it as a single mod. tools/mod_archive.py asserts that, rather than
 # assuming it.
 #
-# Caching: the uncached run took ~21 min, of which xmake's build was 1039-1045s (it compiles
-# CommonLibSSE-NG, whose static lib is ~1.4 GB) and the serde_hkx FFI build 180s. Both
-# are cached below. The xmake build cache key includes the CommonLibSSE-NG submodule
-# revision, because a stale build tree from a different submodule revision would emit a
-# DLL with the wrong SKSE declaration - the exact class of silent-wrong-output this
-# pipeline exists to prevent.
+# Caching, measured: the uncached run is ~21 min, of which xmake's build is ~1040s and the
+# serde_hkx FFI build ~180s. A build-tree cache (738 MiB) was tried and removed - it
+# restored in ~12s and the build still recompiled 517 translation units, because
+# actions/checkout gives every source a fresh mtime so every object looks stale. Its key
+# also omitted src/**, which risked reusing objects across a source edit. Replaced with
+# sccache (content-addressed, SCCACHE_GHA_ENABLED), whose hit rate is printed each run.
 
 on:
   push:
@@ -75,15 +75,10 @@ jobs:
           key: cargo-ffi-v2-${{ runner.os }}-${{ env.SERDE_HKX_SHA }}
           restore-keys: cargo-ffi-${{ runner.os }}-
 
-      # Object files and dependency info for the CommonLibSSE-NG + plugin build.
-      - name: Cache the xmake build tree
-        uses: actions/cache@v4
-        with:
-          path: build
-          key: xmake-build-${{ runner.os }}-${{ steps.subrev.outputs.sha }}-${{ hashFiles('xmake.lua', 'xmake-rules.lua') }}
-          restore-keys: xmake-build-${{ runner.os }}-${{ steps.subrev.outputs.sha }}-
-
       - uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.6
 
       - name: Build the serde_hkx FFI static library
         shell: bash
@@ -113,9 +108,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          xmake f -y -p windows -a x64 -m releasedbg
+          xmake f -y -p windows -a x64 -m releasedbg --ccache=y
           xmake build -y
           ls -l build/windows/x64/releasedbg/ || true
+
+      # Report the compiler-cache hit rate: "the cache is configured" and "the cache is
+      # working" are different claims, and the first attempt at caching this was measured
+      # to do nothing at all.
+      - name: Report the compiler cache hit rate
+        shell: bash
+        run: sccache --show-stats || echo "  sccache stats unavailable"
 
       # "The build succeeded" is not the claim we need. This asserts the exported
       # declaration is well formed and Address-Library independent - and it guards
