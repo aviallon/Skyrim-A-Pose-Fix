@@ -13,6 +13,13 @@ name: build
 # The archive root IS the mod root (SKSE/, meshes/) with no wrapper directory, so a mod
 # manager installs it as a single mod. tools/mod_archive.py asserts that, rather than
 # assuming it.
+#
+# Caching: the uncached run took ~21 min, of which xmake's build was 1045s (it compiles
+# CommonLibSSE-NG, whose static lib is ~1.4 GB) and the serde_hkx FFI build 180s. Both
+# are cached below. The xmake build cache key includes the CommonLibSSE-NG submodule
+# revision, because a stale build tree from a different submodule revision would emit a
+# DLL with the wrong SKSE declaration - the exact class of silent-wrong-output this
+# pipeline exists to prevent.
 
 on:
   push:
@@ -24,6 +31,10 @@ on:
 permissions:
   contents: write
 
+env:
+  SERDE_HKX_REPO: https://github.com/SARDONYX-sard/serde-hkx
+  SERDE_HKX_SHA: 3f53c0596dd916c964d7efe71fb514cc74430a51
+
 jobs:
   windows:
     runs-on: windows-latest
@@ -34,8 +45,41 @@ jobs:
           fetch-depth: 0
 
       - name: Report the pinned CommonLibSSE-NG revision
+        id: subrev
         shell: bash
-        run: git -C lib/commonlibsse-ng log --oneline -1
+        run: |
+          set -euo pipefail
+          git -C lib/commonlibsse-ng log --oneline -1
+          echo "sha=$(git -C lib/commonlibsse-ng rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      # ~/.xmake holds the fetched/built xmake packages (cmake, ninja, directxmath,
+      # directxtk, rapidcsv, spdlog), keyed on the requires lock.
+      - name: Cache xmake packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.xmake
+          key: xmake-pkgs-${{ runner.os }}-${{ hashFiles('xmake.lua', 'xmake-requires.lock', 'xmake-rules.lua') }}
+          restore-keys: xmake-pkgs-${{ runner.os }}-
+
+      # Cargo registry/git plus the pinned crate's target dir. The crate is pinned by
+      # SHA, so the pinned SHA alone is a complete cache key.
+      - name: Cache the Rust FFI build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            .deps/serde-hkx/target
+          key: cargo-ffi-${{ runner.os }}-${{ env.SERDE_HKX_SHA }}
+          restore-keys: cargo-ffi-${{ runner.os }}-
+
+      # Object files and dependency info for the CommonLibSSE-NG + plugin build.
+      - name: Cache the xmake build tree
+        uses: actions/cache@v4
+        with:
+          path: build
+          key: xmake-build-${{ runner.os }}-${{ steps.subrev.outputs.sha }}-${{ hashFiles('xmake.lua', 'xmake-rules.lua') }}
+          restore-keys: xmake-build-${{ runner.os }}-${{ steps.subrev.outputs.sha }}-
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -43,10 +87,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git clone --quiet https://github.com/SARDONYX-sard/serde-hkx "$RUNNER_TEMP/serde-hkx"
-          git -C "$RUNNER_TEMP/serde-hkx" checkout --quiet 3f53c0596dd916c964d7efe71fb514cc74430a51
-          cargo build --release -p serde_hkx_ffi --manifest-path "$RUNNER_TEMP/serde-hkx/Cargo.toml"
-          cp "$RUNNER_TEMP/serde-hkx/target/release/serde_hkx_ffi.lib" lib/serdehkx/
+          mkdir -p .deps
+          if [ ! -d .deps/serde-hkx/.git ]; then
+            git clone --quiet "$SERDE_HKX_REPO" .deps/serde-hkx
+          fi
+          git -C .deps/serde-hkx fetch --quiet origin
+          git -C .deps/serde-hkx checkout --quiet "$SERDE_HKX_SHA"
+          cargo build --release -p serde_hkx_ffi --manifest-path .deps/serde-hkx/Cargo.toml
+          cp .deps/serde-hkx/target/release/serde_hkx_ffi.lib lib/serdehkx/
           ls -l lib/serdehkx/
 
       - uses: xmake-io/github-action-setup-xmake@v1
@@ -62,7 +110,8 @@ jobs:
           ls -l build/windows/x64/releasedbg/ || true
 
       # "The build succeeded" is not the claim we need. This asserts the exported
-      # declaration is well formed and Address-Library independent.
+      # declaration is well formed and Address-Library independent - and it guards
+      # against a stale build cache handing us a DLL from another submodule revision.
       - name: Verify the SKSE version declaration
         shell: bash
         run: python tools/check_skse_version.py build/windows/x64/releasedbg/APoseFix.dll

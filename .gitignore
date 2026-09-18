@@ -12,4 +12,4 @@ vs*/
 # files
 *.zip
 compile_commands.json
-serde_hkx_ffi.lib
+serde_hkx_ffi.lib.deps/
