@@ -70,7 +70,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             .deps/target
-          key: cargo-ffi-${{ runner.os }}-${{ env.SERDE_HKX_SHA }}
+          # v2: the target dir moved out of the crate clone path, so the v1 archive layout
+          # (…/serde-hkx/target) no longer matches; a fresh key avoids restoring it.
+          key: cargo-ffi-v2-${{ runner.os }}-${{ env.SERDE_HKX_SHA }}
           restore-keys: cargo-ffi-${{ runner.os }}-
 
       # Object files and dependency info for the CommonLibSSE-NG + plugin build.
