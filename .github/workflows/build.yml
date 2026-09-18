@@ -14,7 +14,7 @@ name: build
 # manager installs it as a single mod. tools/mod_archive.py asserts that, rather than
 # assuming it.
 #
-# Caching: the uncached run took ~21 min, of which xmake's build was 1045s (it compiles
+# Caching: the uncached run took ~21 min, of which xmake's build was 1039-1045s (it compiles
 # CommonLibSSE-NG, whose static lib is ~1.4 GB) and the serde_hkx FFI build 180s. Both
 # are cached below. The xmake build cache key includes the CommonLibSSE-NG submodule
 # revision, because a stale build tree from a different submodule revision would emit a
@@ -69,7 +69,7 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            .deps/serde-hkx/target
+            .deps/target
           key: cargo-ffi-${{ runner.os }}-${{ env.SERDE_HKX_SHA }}
           restore-keys: cargo-ffi-${{ runner.os }}-
 
@@ -85,16 +85,22 @@ jobs:
 
       - name: Build the serde_hkx FFI static library
         shell: bash
+        env:
+          # Deliberately outside .deps/serde-hkx: the cache restores this directory, and a
+          # restored target/ inside the clone path makes `git clone` refuse the non-empty
+          # destination (the warm run failed there).
+          CARGO_TARGET_DIR: ${{ github.workspace }}/.deps/target
         run: |
           set -euo pipefail
           mkdir -p .deps
           if [ ! -d .deps/serde-hkx/.git ]; then
+            rm -rf .deps/serde-hkx
             git clone --quiet "$SERDE_HKX_REPO" .deps/serde-hkx
           fi
           git -C .deps/serde-hkx fetch --quiet origin
           git -C .deps/serde-hkx checkout --quiet "$SERDE_HKX_SHA"
           cargo build --release -p serde_hkx_ffi --manifest-path .deps/serde-hkx/Cargo.toml
-          cp .deps/serde-hkx/target/release/serde_hkx_ffi.lib lib/serdehkx/
+          cp "$CARGO_TARGET_DIR/release/serde_hkx_ffi.lib" lib/serdehkx/
           ls -l lib/serdehkx/
 
       - uses: xmake-io/github-action-setup-xmake@v1
